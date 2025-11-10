@@ -8,10 +8,10 @@ setup(
     package_dir={"": "src"},
     include_package_data=True,
     install_requires=[
-        "requests>=2.31.0",
+        "requests>=2.32.3",
     ],
     extras_require={
-        "sdk-async": ["httpx>=0.27.0"],
+        "sdk-async": ["httpx>=0.28.1"],
     },
     python_requires=">=3.8",
 )
