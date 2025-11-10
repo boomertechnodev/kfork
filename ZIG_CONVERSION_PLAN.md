@@ -1,19 +1,21 @@
-# K7/Katakate: Python to Zig Conversion Plan
+# K7/Katakate: Python to Zig Conversion Plan - COMPREHENSIVE 30-POINT SPECIFICATION
 
 **Project:** Katakate (K7) - Secure VM Sandbox Orchestration System
-**Current Stack:** Python (FastAPI, Typer, Kubernetes client)
-**Target Stack:** Zig
+**Current Stack:** Python (FastAPI, Typer, Kubernetes client, Rich, Typer)
+**Target Stack:** Zig (native compiled, zero-cost abstractions, manual memory management)
 **Estimated Effort:** 6-12 months (1-2 full-time developers)
+**Current Codebase:** ~3000+ lines Python across 9 source files
+**Target:** High-performance, memory-safe, sub-10MB binary
 
 ---
 
 ## Overview
 
-This document outlines a comprehensive 20-point plan to convert the entire K7 project from Python to Zig, a systems programming language that provides:
-- **Performance:** Native compiled code with zero-cost abstractions
-- **Safety:** Compile-time memory safety without garbage collection
-- **Control:** Manual memory management with allocators
-- **Simplicity:** No hidden control flow, clear error handling
+This document outlines a comprehensive **30-POINT DETAILED PLAN** to convert the entire K7 project from Python to Zig. This plan has been expanded from the original 20-point version to include granular implementation details for each component. Zig is a systems programming language that provides:
+- **Performance:** Native compiled code with zero-cost abstractions, 10x faster startup, 5x lower memory usage
+- **Safety:** Compile-time memory safety without garbage collection, zero null pointers
+- **Control:** Manual memory management with allocators, predictable performance
+- **Simplicity:** No hidden control flow, clear error handling via error unions, explicit everything
 
 ---
 
@@ -1498,17 +1500,415 @@ Run both versions side by side and compare results.
 
 ---
 
+## Phase 5: Advanced Features & Optimization (Points 21-30)
+
+### 21. Implement Prometheus Metrics Exporter
+
+**Tasks:**
+- Create Prometheus metrics exporter module in Zig that exposes `/metrics` endpoint with OpenMetrics format support for integration with Prometheus monitoring systems. Implement counter metrics for API request rates (by endpoint, method, and HTTP status code), histogram metrics for request duration with configurable buckets, gauge metrics for active sandboxes count per namespace and current memory usage, and custom business logic metrics for sandbox creation/deletion rates and API key usage statistics. Use mutex-protected data structures for thread-safe metric updates and implement efficient string interning for label values to minimize memory allocations.
+- Design comprehensive monitoring strategy including Grafana dashboard templates with pre-built visualizations for API performance, sandbox lifecycle, resource utilization, and error rates. Create Prometheus alert rules for critical conditions such as high error rates, memory pressure, slow response times, and failed sandbox creations. Implement metric cardinality controls to prevent explosion of unique label combinations that could overwhelm Prometheus. Add support for custom metric labels from configuration and runtime context to enable flexible querying and aggregation.
+
+**Key Metrics:**
+```zig
+const Metrics = struct {
+    // Counters
+    api_requests_total: CounterVec,        // Labels: method, endpoint, status
+    sandboxes_created_total: Counter,
+    sandboxes_deleted_total: Counter,
+    errors_total: CounterVec,              // Labels: error_type
+
+    // Gauges
+    active_sandboxes: GaugeVec,            // Labels: namespace
+    memory_usage_bytes: Gauge,
+    api_keys_active: Gauge,
+
+    // Histograms
+    request_duration_seconds: HistogramVec, // Labels: endpoint
+    sandbox_creation_duration_seconds: Histogram,
+    kubernetes_api_duration_seconds: HistogramVec, // Labels: operation
+};
+```
+
+**Deliverables:**
+- Prometheus metrics exporter (`src/common/metrics.zig`)
+- Grafana dashboard JSON templates
+- Prometheus alert rule YAML files
+- Metrics documentation with cardinality analysis
+- Performance impact benchmarks
+
+---
+
+### 22. Build Rate Limiting & DDoS Protection
+
+**Tasks:**
+- Implement token bucket rate limiting algorithm in Zig with configurable limits per API key, per IP address, and global request rate caps to prevent API abuse and resource exhaustion attacks. Design sliding window counters using efficient ring buffer data structures to track request rates over configurable time windows (e.g., 100 requests per minute per API key). Implement distributed rate limiting state using shared memory or external Redis backend for multi-instance API deployments to ensure consistent limits across all API server instances. Add backpressure mechanisms that return 429 Too Many Requests responses with Retry-After headers when limits are exceeded, and implement exponential backoff suggestions for clients.
+- Create DDoS protection layer with adaptive rate limiting that automatically tightens limits during attack scenarios based on error rates and response time degradation. Implement connection throttling to limit concurrent connections per IP and per API key. Add request size limits for JSON payloads to prevent memory exhaustion attacks. Implement IP allowlisting and blocklisting with CIDR support for manual override of rate limits. Create admin API endpoints for real-time rate limit adjustment without service restart. Integrate with Prometheus metrics to track rate limit hits and blocked requests for attack pattern analysis.
+
+**Rate Limit Structure:**
+```zig
+const RateLimiter = struct {
+    allocator: std.mem.Allocator,
+
+    // Per-API-key limits
+    api_key_limits: std.StringHashMap(TokenBucket),
+
+    // Per-IP limits
+    ip_limits: std.StringHashMap(TokenBucket),
+
+    // Global limit
+    global_limit: TokenBucket,
+
+    // Configuration
+    config: RateLimitConfig,
+
+    pub fn checkLimit(self: *RateLimiter, api_key: []const u8, ip: []const u8) !bool
+    pub fn recordRequest(self: *RateLimiter, api_key: []const u8, ip: []const u8) !void
+    pub fn getRemainingQuota(self: *RateLimiter, api_key: []const u8) !u64
+};
+```
+
+**Deliverables:**
+- Rate limiting middleware (`src/api/ratelimit.zig`)
+- DDoS protection module
+- Configuration system for rate limits
+- Admin API for limit management
+- Attack simulation test suite
+
+---
+
+### 23. Create Health Check & Readiness Probes
+
+**Tasks:**
+- Implement comprehensive health check system in Zig with separate `/health/live` liveness probe endpoint (returns 200 if process is alive) and `/health/ready` readiness probe endpoint (returns 200 only if all dependencies are healthy including Kubernetes API connectivity, API key file accessibility, and internal service state). Design dependency health check framework that periodically polls Kubernetes API server, verifies kubeconfig validity, tests API key file read permissions, and validates internal state consistency. Implement circuit breaker pattern for health checks to avoid cascading failures when dependencies are temporarily unavailable. Add configurable health check intervals, timeout values, and failure threshold counts before marking service unhealthy.
+- Create structured health check responses with JSON payload containing detailed status for each dependency component, version information, uptime statistics, and resource utilization metrics to aid in debugging and operational visibility. Implement graceful shutdown sequence that marks service as not-ready immediately upon receiving SIGTERM, drains existing connections with configurable timeout, and only exits after all in-flight requests complete or timeout expires. Add startup health checks that verify all critical dependencies before marking service ready to prevent routing traffic to partially initialized instances. Integrate health check status with Prometheus metrics for alerting on prolonged unhealthy states.
+
+**Health Check Response:**
+```zig
+const HealthStatus = struct {
+    status: enum { healthy, degraded, unhealthy },
+    version: []const u8,
+    uptime_seconds: u64,
+    checks: []ComponentHealth,
+
+    const ComponentHealth = struct {
+        name: []const u8,
+        status: enum { pass, warn, fail },
+        message: ?[]const u8,
+        duration_ms: u64,
+    };
+};
+```
+
+**Deliverables:**
+- Health check endpoints (`src/api/health.zig`)
+- Dependency health check framework
+- Graceful shutdown handler
+- Kubernetes liveness/readiness probe configs
+- Health check integration tests
+
+---
+
+### 24. Implement Request Tracing & Correlation IDs
+
+**Tasks:**
+- Build distributed tracing system in Zig using OpenTelemetry standards to track request flow across API server, K7Core logic, and Kubernetes API calls with hierarchical span relationships. Implement automatic trace context propagation through all function calls using thread-local storage or async context to maintain trace IDs without manual parameter passing. Generate unique correlation IDs (UUID v4) for each incoming API request and inject them into all log statements, error responses, and outgoing Kubernetes API requests for end-to-end request tracking. Add trace sampling logic with configurable sampling rates to balance observability needs with performance overhead and storage costs.
+- Create trace export mechanism that sends span data to OpenTelemetry collector or Jaeger backend via gRPC or HTTP protocol with batching and retry logic for reliability. Implement custom span attributes for K7-specific context including sandbox name, namespace, operation type, API key name (not value), and resource limits. Add trace visualization support by ensuring span timing and parent-child relationships are correctly represented for flame graph rendering. Integrate tracing with logging system to include trace IDs in structured log fields for correlation between logs and traces. Create sampling decision logic based on request characteristics like error status, slow response times, or specific API endpoints to always capture problematic requests.
+
+**Tracing Architecture:**
+```zig
+const Tracer = struct {
+    allocator: std.mem.Allocator,
+    exporter: TraceExporter,
+    sampler: TraceSampler,
+
+    pub fn startSpan(self: *Tracer, name: []const u8, parent: ?*Span) !*Span
+    pub fn endSpan(self: *Tracer, span: *Span) !void
+    pub fn injectContext(self: *Tracer, span: *Span, headers: *HttpHeaders) !void
+    pub fn extractContext(self: *Tracer, headers: *HttpHeaders) !?TraceContext
+};
+
+const Span = struct {
+    trace_id: [16]u8,      // 128-bit trace ID
+    span_id: [8]u8,        // 64-bit span ID
+    parent_span_id: ?[8]u8,
+    name: []const u8,
+    start_time: i64,
+    end_time: ?i64,
+    attributes: std.StringHashMap([]const u8),
+    events: std.ArrayList(SpanEvent),
+};
+```
+
+**Deliverables:**
+- OpenTelemetry tracing module (`src/common/tracing.zig`)
+- Trace context propagation middleware
+- Jaeger/OTLP exporter implementation
+- Sampling strategy configuration
+- Trace visualization examples
+
+---
+
+### 25. Add Configuration Management System
+
+**Tasks:**
+- Design comprehensive configuration management system in Zig that supports multiple configuration sources with clear precedence order: command-line flags (highest priority), environment variables (middle priority), and configuration files in YAML or TOML format (lowest priority). Implement configuration schema validation at startup to catch misconfiguration early with helpful error messages indicating specific validation failures and expected value formats. Create type-safe configuration struct with compile-time guarantees that all required fields are provided and optional fields have sensible defaults. Support configuration hot-reload via file watching or SIGHUP signal handler to update non-critical settings without service restart, with atomic configuration swap to prevent partial updates.
+- Implement configuration sections for API server (bind address, port, TLS certificates, CORS settings), authentication (API key file path, hash algorithm, expiry policy), Kubernetes client (kubeconfig path, API server URL, timeout values, retry policy), rate limiting (limits per key/IP/global, time windows), logging (level, format, output destination), and metrics (enabled exporters, scrape interval, cardinality limits). Add configuration validation business rules such as ensuring port numbers are in valid range, file paths exist and are readable, and numeric values are within sensible bounds. Create configuration dump command that prints active configuration to stdout for debugging, masking sensitive values like API keys and passwords. Implement configuration versioning with migration support for backward compatibility when config schema evolves.
+
+**Configuration Structure:**
+```zig
+const Config = struct {
+    server: ServerConfig,
+    auth: AuthConfig,
+    kubernetes: KubernetesConfig,
+    rate_limiting: RateLimitConfig,
+    logging: LogConfig,
+    metrics: MetricsConfig,
+
+    const ServerConfig = struct {
+        bind_address: []const u8 = "0.0.0.0",
+        port: u16 = 8000,
+        tls_enabled: bool = false,
+        tls_cert_path: ?[]const u8 = null,
+        tls_key_path: ?[]const u8 = null,
+        cors_origins: [][]const u8 = &.{},
+    };
+
+    pub fn load(allocator: std.mem.Allocator) !Config
+    pub fn validate(self: *const Config) !void
+    pub fn reload(self: *Config) !void
+};
+```
+
+**Deliverables:**
+- Configuration management system (`src/common/config.zig`)
+- Schema validation framework
+- Hot-reload mechanism
+- Configuration migration utilities
+- Example config files (YAML/TOML)
+
+---
+
+### 26. Implement Audit Logging & Security Events
+
+**Tasks:**
+- Create comprehensive audit logging system in Zig that records all security-relevant events including API authentication attempts (both successful and failed with reason), API key lifecycle events (generation, revocation, expiration), sandbox creation/deletion operations with requesting user context, privilege escalation attempts via capability additions, network policy modifications, and admin command executions. Design audit log format using structured JSON with consistent schema including timestamp (ISO 8601), event type classification, actor identification (API key name, IP address), resource affected (sandbox name, namespace), operation attempted, success/failure outcome, and additional context-specific metadata.
+- Implement tamper-evident audit log storage using append-only file mode with file integrity verification via cryptographic hash chains where each log entry includes hash of previous entry to detect tampering or deletion. Create audit log rotation policy with configurable file size or time-based rotation, compression of old logs, and retention policy enforcement. Add audit log querying API with filtering by time range, event type, actor, resource, and outcome for security investigations and compliance reporting. Implement real-time audit event streaming to external SIEM systems via syslog protocol or message queue for centralized security monitoring. Create audit log anonymization tool for sharing logs externally by redacting sensitive fields while preserving investigation utility.
+
+**Audit Event Structure:**
+```zig
+const AuditEvent = struct {
+    id: [16]u8,                    // UUID
+    timestamp: i64,                // Unix timestamp (nanoseconds)
+    event_type: EventType,
+    severity: Severity,
+    actor: Actor,
+    resource: Resource,
+    operation: []const u8,
+    outcome: enum { success, failure, error },
+    error_message: ?[]const u8,
+    metadata: std.json.Value,
+    previous_hash: [32]u8,         // SHA-256 of previous audit entry
+
+    const EventType = enum {
+        authentication,
+        authorization,
+        sandbox_creation,
+        sandbox_deletion,
+        sandbox_exec,
+        api_key_generated,
+        api_key_revoked,
+        config_changed,
+        security_violation,
+    };
+};
+```
+
+**Deliverables:**
+- Audit logging system (`src/common/audit.zig`)
+- Hash chain verification tool
+- Audit log query API
+- SIEM integration module
+- Audit log analysis scripts
+
+---
+
+### 27. Create Backup & Disaster Recovery System
+
+**Tasks:**
+- Implement automated backup system in Zig for critical K7 state including API key database, audit logs, configuration files, and operational metadata with configurable backup schedule (hourly, daily, weekly). Design backup format using tar.gz archives with manifest file describing backup contents, creation timestamp, K7 version, and integrity checksums for each component. Create incremental backup mechanism that only captures changes since last full backup to minimize storage requirements and backup duration. Implement backup encryption using AES-256-GCM with key derivation from admin-provided passphrase or external key management service integration to protect sensitive data at rest.
+- Build restore procedure that validates backup integrity via checksum verification before restoration, supports point-in-time recovery to specific backup timestamp, and handles version compatibility by migrating old backup formats to current schema. Create backup storage abstraction supporting local filesystem, S3-compatible object storage, and network file systems with unified API. Implement backup retention policy with configurable keep rules (e.g., daily for 7 days, weekly for 4 weeks, monthly for 12 months) and automatic cleanup of expired backups. Add disaster recovery testing framework that performs periodic restore drills to separate test environment to verify backup viability. Create backup monitoring integration with Prometheus metrics tracking backup success/failure, backup size trends, and time since last successful backup for alerting on backup system failures.
+
+**Backup Management:**
+```zig
+const BackupManager = struct {
+    allocator: std.mem.Allocator,
+    storage: BackupStorage,
+    encryption_key: [32]u8,
+
+    pub fn createBackup(self: *BackupManager, backup_type: BackupType) !BackupInfo
+    pub fn listBackups(self: *BackupManager) ![]BackupInfo
+    pub fn restoreBackup(self: *BackupManager, backup_id: []const u8, options: RestoreOptions) !void
+    pub fn verifyBackup(self: *BackupManager, backup_id: []const u8) !bool
+    pub fn pruneBackups(self: *BackupManager, retention_policy: RetentionPolicy) !void
+};
+
+const BackupInfo = struct {
+    id: []const u8,
+    timestamp: i64,
+    backup_type: enum { full, incremental },
+    size_bytes: u64,
+    components: [][]const u8,
+    checksum: [32]u8,
+};
+```
+
+**Deliverables:**
+- Backup management system (`src/common/backup.zig`)
+- Restore procedure implementation
+- Encryption/decryption module
+- Backup storage adapters (local, S3)
+- Disaster recovery runbook
+
+---
+
+### 28. Implement Multi-Tenancy & Namespace Isolation
+
+**Tasks:**
+- Design multi-tenancy architecture in Zig that enforces strict namespace isolation where each API key is scoped to specific Kubernetes namespaces with role-based access control determining permitted operations per namespace. Implement namespace-aware API endpoints that validate requesting API key has permission to access target namespace before executing operations, preventing unauthorized cross-tenant access. Create tenant resource quota system that tracks and enforces limits on number of sandboxes per tenant, total CPU/memory allocation across tenant's sandboxes, and API request rate limits per tenant to prevent resource monopolization. Add tenant-specific configuration profiles allowing customization of default sandbox settings, network policies, and security contexts per tenant while maintaining system-wide security baselines.
+- Build tenant lifecycle management API with endpoints for creating tenants (namespace + API keys + quotas), updating tenant quotas and permissions, suspending tenants to temporarily block all operations, and deleting tenants with automatic cleanup of all associated resources. Implement tenant usage tracking and billing metrics including sandbox runtime hours, API request counts, and resource consumption statistics per tenant for chargeback reporting. Create tenant isolation verification tests that attempt unauthorized cross-tenant access patterns to validate security boundaries. Add tenant onboarding workflow automation that provisions namespace, generates initial API key, sets default quotas, and sends welcome email with credentials. Implement tenant audit trail that records all operations performed by tenant for compliance and troubleshooting.
+
+**Multi-Tenancy Structure:**
+```zig
+const TenantManager = struct {
+    allocator: std.mem.Allocator,
+    kube_client: *KubernetesClient,
+
+    pub fn createTenant(self: *TenantManager, config: TenantConfig) !Tenant
+    pub fn getTenant(self: *TenantManager, tenant_id: []const u8) !Tenant
+    pub fn updateQuotas(self: *TenantManager, tenant_id: []const u8, quotas: ResourceQuotas) !void
+    pub fn suspendTenant(self: *TenantManager, tenant_id: []const u8) !void
+    pub fn deleteTenant(self: *TenantManager, tenant_id: []const u8) !void
+    pub fn getTenantUsage(self: *TenantManager, tenant_id: []const u8) !UsageStats
+};
+
+const Tenant = struct {
+    id: []const u8,
+    name: []const u8,
+    namespaces: [][]const u8,
+    quotas: ResourceQuotas,
+    api_keys: [][]const u8,
+    status: enum { active, suspended, deleted },
+    created_at: i64,
+};
+```
+
+**Deliverables:**
+- Multi-tenancy module (`src/core/tenancy.zig`)
+- Namespace isolation enforcement
+- Tenant quota system
+- Tenant lifecycle API
+- Cross-tenant access tests
+
+---
+
+### 29. Add Observability with Structured Logging
+
+**Tasks:**
+- Implement comprehensive structured logging system in Zig using JSON log format for machine-parseable output with consistent field schema across all log entries including timestamp (ISO 8601 with nanosecond precision), log level (debug/info/warn/error), logger name (component identifier), message (human-readable description), trace ID (for request correlation), and context fields (sandbox name, namespace, operation, API key, etc.). Design log levels with semantic meaning: DEBUG for detailed execution flow useful during development, INFO for important state changes and business events, WARN for degraded conditions that don't prevent operation, and ERROR for failures requiring intervention. Create contextual logging API that allows attaching metadata to logger instance which is automatically included in all subsequent log entries from that context, reducing boilerplate.
+- Implement log output destinations supporting stdout/stderr for container environments, file output with rotation for traditional deployments, and network sinks like syslog or logstash for centralized aggregation. Add log filtering at runtime based on logger name patterns and minimum level to control verbosity without code changes. Create log sampling to reduce high-frequency log statement volume (e.g., successful health checks) while preserving anomalies. Implement log redaction for sensitive fields like API keys and environment variables to prevent credential leakage in logs. Build log querying CLI tool that parses JSON logs with filtering by time range, log level, component, trace ID, or custom field values for operational debugging. Integrate logging with error tracking systems like Sentry to automatically capture error logs with full context for investigation.
+
+**Structured Logging:**
+```zig
+const Logger = struct {
+    name: []const u8,
+    level: LogLevel,
+    output: LogOutput,
+    context: std.StringHashMap(std.json.Value),
+
+    pub fn debug(self: *Logger, comptime fmt: []const u8, args: anytype) void
+    pub fn info(self: *Logger, comptime fmt: []const u8, args: anytype) void
+    pub fn warn(self: *Logger, comptime fmt: []const u8, args: anytype) void
+    pub fn err(self: *Logger, comptime fmt: []const u8, args: anytype) void
+
+    pub fn withField(self: *Logger, key: []const u8, value: anytype) *Logger
+    pub fn withFields(self: *Logger, fields: anytype) *Logger
+};
+
+// Example usage:
+logger.withField("sandbox", "demo")
+    .withField("namespace", "default")
+    .info("Created sandbox successfully", .{});
+
+// Output:
+// {"timestamp":"2025-01-15T10:30:45.123456789Z","level":"info","logger":"k7.core","message":"Created sandbox successfully","sandbox":"demo","namespace":"default","trace_id":"a1b2c3d4"}
+```
+
+**Deliverables:**
+- Structured logging system (`src/common/logging.zig`)
+- Log rotation and retention
+- Log redaction module
+- Log query CLI tool
+- Logging best practices guide
+
+---
+
+### 30. Implement Comprehensive Integration Test Suite
+
+**Tasks:**
+- Create end-to-end integration test suite in Zig that validates complete workflows from API request through Kubernetes operations to sandbox lifecycle with real or mock Kubernetes cluster. Build test harness that automatically sets up test environment including kind (Kubernetes in Docker) cluster with Kata runtime installed, test namespaces, test API keys, and network policies. Implement test scenarios covering happy paths (successful sandbox creation, execution, deletion), error paths (invalid config, missing dependencies, quota exceeded), edge cases (concurrent operations, resource exhaustion, network failures), and security scenarios (unauthorized access attempts, privilege escalation, network policy violation).
+- Design test data factories in Zig that generate valid and invalid test inputs including SandboxConfig variants, kubeconfig files with different auth methods, API key configurations, and network policy specifications. Create test fixtures for mock Kubernetes API responses using recorded real API traffic or handcrafted responses for deterministic testing. Implement test cleanup that ensures all created resources (namespaces, deployments, secrets, network policies) are deleted after tests complete even on failure to prevent test pollution. Add performance regression tests that measure API response times, memory usage, and throughput to detect performance degradation in code changes. Build test reporting that generates detailed test results with execution time, resource usage, and coverage metrics in machine-readable format (JUnit XML, JSON) for CI integration. Create chaos testing scenarios using Toxiproxy or similar to inject network latency, packet loss, and service failures to validate resilience.
+
+**Integration Test Structure:**
+```zig
+const IntegrationTest = struct {
+    allocator: std.mem.Allocator,
+    kube_client: *KubernetesClient,
+    api_client: *K7ApiClient,
+    test_namespace: []const u8,
+
+    pub fn setUp(self: *IntegrationTest) !void {
+        // Create test namespace, API keys, etc.
+    }
+
+    pub fn tearDown(self: *IntegrationTest) !void {
+        // Clean up all test resources
+    }
+
+    pub fn testSandboxLifecycle(self: *IntegrationTest) !void {
+        // Create -> Exec -> Delete workflow
+    }
+
+    pub fn testNetworkPolicyEnforcement(self: *IntegrationTest) !void {
+        // Verify egress whitelisting works
+    }
+
+    pub fn testConcurrentOperations(self: *IntegrationTest) !void {
+        // Multiple parallel sandbox operations
+    }
+};
+```
+
+**Deliverables:**
+- Integration test suite (`tests/integration/`)
+- Test environment setup automation
+- Mock Kubernetes API server
+- Chaos testing scenarios
+- CI/CD integration configuration
+
+---
+
 ## Summary & Timeline
 
 ### Estimated Effort
 
 | Phase | Points | Estimated Time | Complexity |
 |-------|--------|----------------|------------|
-| Phase 1: Foundation | 1-5 | 2-3 months | High |
-| Phase 2: Core Logic | 6-10 | 2-3 months | High |
-| Phase 3: Performance | 11-15 | 1-2 months | Medium |
-| Phase 4: Deployment | 16-20 | 1-2 months | Low-Medium |
-| **Total** | **20 points** | **6-12 months** | **High** |
+| Phase 1: Foundation & Infrastructure | 1-5 | 2-3 months | High |
+| Phase 2: Core Business Logic | 6-10 | 2-3 months | High |
+| Phase 3: Async I/O & Performance | 11-15 | 1-2 months | Medium |
+| Phase 4: Packaging & Deployment | 16-20 | 1-2 months | Medium |
+| Phase 5: Advanced Features & Optimization | 21-30 | 2-3 months | Medium-High |
+| **Total** | **30 points** | **8-14 months** | **High** |
 
 ### Risk Assessment
 
