@@ -654,9 +654,87 @@ pub const ApiServer = struct {
     }
 
     fn handleInstall(self: *ApiServer, response: *std.http.Server.Response) !void {
-        _ = self;
-        // TODO: Implement installation endpoint
-        try self.sendJsonError(response, .not_implemented, "Install endpoint not yet implemented");
+        // Read request body
+        var body_buffer: [10 * 1024 * 1024]u8 = undefined; // 10MB max for playbook/inventory
+        const body = try response.reader().readAll(&body_buffer);
+
+        // Parse JSON request body
+        // Expected format: {"playbook_content":"...","inventory_content":"...","verbose":true}
+        const parsed_request = blk: {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
+
+            const parsed = std.json.parseFromSlice(
+                std.json.Value,
+                arena_allocator,
+                body,
+                .{},
+            ) catch {
+                try self.sendJsonError(response, .bad_request, "Invalid JSON in request body");
+                return;
+            };
+
+            const root = parsed.value;
+            if (root != .object) {
+                try self.sendJsonError(response, .bad_request, "Request body must be JSON object");
+                return;
+            }
+
+            // Extract playbook_content (optional)
+            const playbook_content = if (root.object.get("playbook_content")) |pc|
+                if (pc == .string) try self.allocator.dupe(u8, pc.string) else null
+            else
+                null;
+
+            // Extract inventory_content (optional)
+            const inventory_content = if (root.object.get("inventory_content")) |ic|
+                if (ic == .string) try self.allocator.dupe(u8, ic.string) else null
+            else
+                null;
+
+            // Extract verbose (optional, default false)
+            const verbose = if (root.object.get("verbose")) |v|
+                if (v == .bool) v.bool else false
+            else
+                false;
+
+            break :blk .{
+                .playbook_content = playbook_content,
+                .inventory_content = inventory_content,
+                .verbose = verbose,
+            };
+        };
+        defer if (parsed_request.playbook_content) |pc| self.allocator.free(pc);
+        defer if (parsed_request.inventory_content) |ic| self.allocator.free(ic);
+
+        // Call installNode
+        const result = self.k7_core.installNode(
+            parsed_request.playbook_content,
+            parsed_request.inventory_content,
+            parsed_request.verbose,
+            null, // No progress callback for HTTP endpoint
+        ) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to install K7: {s}",
+                .{@errorName(err)},
+            );
+            defer self.allocator.free(err_msg);
+            try self.sendJsonError(response, .internal_server_error, err_msg);
+            return;
+        };
+        defer result.deinit(self.allocator);
+
+        // Return result as JSON
+        const json = try result.toJson(self.allocator);
+        defer self.allocator.free(json);
+
+        try response.headers.append("content-type", "application/json");
+        response.status = .ok;
+        try response.do();
+        try response.writeAll(json);
+        try response.finish();
     }
 
     // ========================================================================

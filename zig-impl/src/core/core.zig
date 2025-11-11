@@ -1298,24 +1298,250 @@ pub const K7Core = struct {
         verbose: bool,
         progress_callback: ?*const fn (event: ProgressEvent) void,
     ) !models.OperationResult {
-        _ = self;
-        _ = playbook_content;
-        _ = inventory_content;
-        _ = verbose;
-        _ = progress_callback;
+        // Default playbook content if not provided
+        const default_playbook =
+            \\---
+            \\- name: Install K7/Katakate
+            \\  hosts: all
+            \\  become: yes
+            \\  tasks:
+            \\    - name: Update package cache
+            \\      apt:
+            \\        update_cache: yes
+            \\    - name: Install dependencies
+            \\      apt:
+            \\        name:
+            \\          - curl
+            \\          - wget
+            \\        state: present
+            \\    - name: Download K7 installer
+            \\      get_url:
+            \\        url: https://example.com/k7-installer.sh
+            \\        dest: /tmp/k7-installer.sh
+            \\        mode: '0755'
+            \\    - name: Run K7 installer
+            \\      command: /tmp/k7-installer.sh
+        ;
 
-        // TODO: Implement Ansible execution:
-        // 1. Create temporary files for playbook and inventory
-        // 2. Spawn ansible-playbook subprocess
-        // 3. Stream stdout/stderr
-        // 4. Parse output for progress (TASK [...] lines)
-        // 5. Invoke progress callback
-        // 6. Return success/failure
+        const default_inventory =
+            \\[k7_nodes]
+            \\localhost ansible_connection=local
+        ;
 
-        return try models.OperationResult.success_result(
+        const playbook = playbook_content orelse default_playbook;
+        const inventory = inventory_content orelse default_inventory;
+
+        // Create temporary directory
+        const temp_dir_path = try std.fmt.allocPrint(
             self.allocator,
-            "Installation completed successfully (placeholder)",
+            "/tmp/k7-install-{d}",
+            .{std.time.timestamp()},
         );
+        defer self.allocator.free(temp_dir_path);
+
+        std.fs.makeDirAbsolute(temp_dir_path) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to create temp directory: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+        defer std.fs.deleteTreeAbsolute(temp_dir_path) catch {};
+
+        // Write playbook to temp file
+        const playbook_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/playbook.yml",
+            .{temp_dir_path},
+        );
+        defer self.allocator.free(playbook_path);
+
+        const playbook_file = std.fs.createFileAbsolute(playbook_path, .{}) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to create playbook file: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+        defer playbook_file.close();
+
+        playbook_file.writeAll(playbook) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to write playbook: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+
+        // Write inventory to temp file
+        const inventory_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/inventory",
+            .{temp_dir_path},
+        );
+        defer self.allocator.free(inventory_path);
+
+        const inventory_file = std.fs.createFileAbsolute(inventory_path, .{}) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to create inventory file: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+        defer inventory_file.close();
+
+        inventory_file.writeAll(inventory) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to write inventory: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+
+        // Build ansible-playbook command
+        var argv = std.ArrayList([]const u8).init(self.allocator);
+        defer argv.deinit();
+
+        try argv.append("ansible-playbook");
+        try argv.append("-i");
+        try argv.append(inventory_path);
+        try argv.append(playbook_path);
+
+        if (verbose) {
+            try argv.append("-vvv");
+        }
+
+        // Invoke progress callback if provided
+        if (progress_callback) |cb| {
+            cb(ProgressEvent{
+                .stage = "ansible",
+                .status = "starting",
+                .message = "Starting Ansible playbook execution",
+            });
+        }
+
+        // Spawn ansible-playbook subprocess
+        var child = std.process.Child.init(try argv.toOwnedSlice(), self.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+
+        child.spawn() catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to spawn ansible-playbook: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+
+        // Read stdout in a separate buffer
+        var stdout_buffer = std.ArrayList(u8).init(self.allocator);
+        defer stdout_buffer.deinit();
+
+        var stderr_buffer = std.ArrayList(u8).init(self.allocator);
+        defer stderr_buffer.deinit();
+
+        // Read all stdout
+        if (child.stdout) |stdout| {
+            const stdout_reader = stdout.reader();
+            stdout_reader.readAllArrayList(&stdout_buffer, 10 * 1024 * 1024) catch |err| {
+                _ = err; // Ignore read errors, process might finish
+            };
+        }
+
+        // Read all stderr
+        if (child.stderr) |stderr| {
+            const stderr_reader = stderr.reader();
+            stderr_reader.readAllArrayList(&stderr_buffer, 10 * 1024 * 1024) catch |err| {
+                _ = err; // Ignore read errors
+            };
+        }
+
+        // Wait for process to complete
+        const result = child.wait() catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to wait for ansible-playbook: {s}",
+                .{@errorName(err)},
+            );
+            return try models.OperationResult.error_result(self.allocator, err_msg);
+        };
+
+        // Parse stdout for TASK lines and invoke progress callback
+        if (progress_callback) |cb| {
+            var line_iter = std.mem.splitScalar(u8, stdout_buffer.items, '\n');
+            while (line_iter.next()) |line| {
+                // Look for TASK lines: "TASK [Task Name] *****"
+                if (std.mem.indexOf(u8, line, "TASK [")) |task_start| {
+                    const task_name_start = task_start + 6;
+                    if (std.mem.indexOf(u8, line[task_name_start..], "]")) |task_name_end| {
+                        const task_name = line[task_name_start .. task_name_start + task_name_end];
+                        cb(ProgressEvent{
+                            .stage = "ansible",
+                            .status = "running",
+                            .message = task_name,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check exit code
+        switch (result) {
+            .Exited => |code| {
+                if (code == 0) {
+                    if (progress_callback) |cb| {
+                        cb(ProgressEvent{
+                            .stage = "ansible",
+                            .status = "success",
+                            .message = "Ansible playbook completed successfully",
+                        });
+                    }
+                    return try models.OperationResult.success_result(
+                        self.allocator,
+                        "Installation completed successfully",
+                    );
+                } else {
+                    const stderr_str = try self.allocator.dupe(u8, stderr_buffer.items);
+                    const err_msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Ansible playbook failed with exit code {d}: {s}",
+                        .{ code, stderr_str },
+                    );
+                    self.allocator.free(stderr_str);
+                    return try models.OperationResult.error_result(self.allocator, err_msg);
+                }
+            },
+            .Signal => |sig| {
+                const err_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Ansible playbook killed by signal {d}",
+                    .{sig},
+                );
+                return try models.OperationResult.error_result(self.allocator, err_msg);
+            },
+            .Stopped => |code| {
+                const err_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Ansible playbook stopped with code {d}",
+                    .{code},
+                );
+                return try models.OperationResult.error_result(self.allocator, err_msg);
+            },
+            .Unknown => |code| {
+                const err_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Ansible playbook exited with unknown status {d}",
+                    .{code},
+                );
+                return try models.OperationResult.error_result(self.allocator, err_msg);
+            },
+        }
     }
 };
 
