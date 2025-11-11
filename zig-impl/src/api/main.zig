@@ -301,8 +301,12 @@ pub const ApiServer = struct {
     }
 
     fn handleListSandboxes(self: *ApiServer, response: *std.http.Server.Response) !void {
-        // TODO: Parse namespace from query params
-        const namespace = null;
+        // Parse namespace from query params
+        const target = response.request.target;
+        const namespace_param = try parseQueryParam(self.allocator, target, "namespace");
+        defer if (namespace_param) |ns| self.allocator.free(ns);
+
+        const namespace: ?[]const u8 = namespace_param;
 
         const sandboxes = self.k7_core.listSandboxes(namespace) catch |err| {
             const err_msg = try std.fmt.allocPrint(
@@ -347,8 +351,12 @@ pub const ApiServer = struct {
     }
 
     fn handleDeleteSandbox(self: *ApiServer, response: *std.http.Server.Response, name: []const u8) !void {
-        // TODO: Parse namespace from query params
-        const namespace = "default";
+        // Parse namespace from query params (default: "default")
+        const target = response.request.target;
+        const namespace_param = try parseQueryParam(self.allocator, target, "namespace");
+        defer if (namespace_param) |ns| self.allocator.free(ns);
+
+        const namespace = namespace_param orelse "default";
 
         const result = self.k7_core.deleteSandbox(name, namespace) catch |err| {
             const err_msg = try std.fmt.allocPrint(
@@ -373,7 +381,12 @@ pub const ApiServer = struct {
     }
 
     fn handleDeleteAllSandboxes(self: *ApiServer, response: *std.http.Server.Response) !void {
-        const namespace = "default";
+        // Parse namespace from query params (default: "default")
+        const target = response.request.target;
+        const namespace_param = try parseQueryParam(self.allocator, target, "namespace");
+        defer if (namespace_param) |ns| self.allocator.free(ns);
+
+        const namespace = namespace_param orelse "default";
 
         const result = self.k7_core.deleteAllSandboxes(namespace) catch |err| {
             const err_msg = try std.fmt.allocPrint(
@@ -398,14 +411,53 @@ pub const ApiServer = struct {
     }
 
     fn handleExecCommand(self: *ApiServer, response: *std.http.Server.Response, sandbox_name: []const u8) !void {
+        // Parse namespace from query params (default: "default")
+        const target = response.request.target;
+        const namespace_param = try parseQueryParam(self.allocator, target, "namespace");
+        defer if (namespace_param) |ns| self.allocator.free(ns);
+
+        const namespace = namespace_param orelse "default";
+
         // Read request body
         var body_buffer: [1024 * 1024]u8 = undefined;
         const body = try response.reader().readAll(&body_buffer);
 
-        // TODO: Parse JSON to get command
-        // For now, use placeholder
-        const command = "echo hello";
-        const namespace = "default";
+        // Parse JSON to get command
+        // Expected format: {"command": "ls -la"}
+        const command = blk: {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
+
+            const parsed = std.json.parseFromSlice(
+                std.json.Value,
+                arena_allocator,
+                body,
+                .{},
+            ) catch {
+                try self.sendJsonError(response, .bad_request, "Invalid JSON in request body");
+                return;
+            };
+
+            const root = parsed.value;
+            if (root != .object) {
+                try self.sendJsonError(response, .bad_request, "Request body must be JSON object");
+                return;
+            }
+
+            const cmd_value = root.object.get("command") orelse {
+                try self.sendJsonError(response, .bad_request, "Missing 'command' field in request body");
+                return;
+            };
+
+            if (cmd_value != .string) {
+                try self.sendJsonError(response, .bad_request, "'command' must be a string");
+                return;
+            }
+
+            break :blk try self.allocator.dupe(u8, cmd_value.string);
+        };
+        defer self.allocator.free(command);
 
         const result = self.k7_core.execCommand(sandbox_name, command, namespace) catch |err| {
             const err_msg = try std.fmt.allocPrint(
@@ -432,7 +484,12 @@ pub const ApiServer = struct {
     }
 
     fn handleGetMetrics(self: *ApiServer, response: *std.http.Server.Response) !void {
-        const namespace = null;
+        // Parse namespace from query params
+        const target = response.request.target;
+        const namespace_param = try parseQueryParam(self.allocator, target, "namespace");
+        defer if (namespace_param) |ns| self.allocator.free(ns);
+
+        const namespace: ?[]const u8 = namespace_param;
 
         const metrics = self.k7_core.getSandboxMetrics(namespace) catch |err| {
             const err_msg = try std.fmt.allocPrint(
@@ -446,8 +503,29 @@ pub const ApiServer = struct {
         };
         defer self.allocator.free(metrics);
 
-        // TODO: Serialize metrics to JSON
-        const json = "[]";
+        // Serialize metrics to JSON
+        var json_array = std.ArrayList(u8).init(self.allocator);
+        defer json_array.deinit();
+
+        try json_array.append('[');
+        for (metrics, 0..) |metric, i| {
+            if (i > 0) try json_array.append(',');
+
+            // Manually build JSON object for each metric
+            // {"name":"pod-name","namespace":"default","cpu_usage":"100m","memory_usage":"256Mi"}
+            const metric_json = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"name\":\"{s}\",\"namespace\":\"{s}\",\"cpu_usage\":\"{s}\",\"memory_usage\":\"{s}\"}}",
+                .{ metric.name, metric.namespace, metric.cpu_usage, metric.memory_usage },
+            );
+            defer self.allocator.free(metric_json);
+
+            try json_array.appendSlice(metric_json);
+        }
+        try json_array.append(']');
+
+        const json = try json_array.toOwnedSlice();
+        defer self.allocator.free(json);
 
         try response.headers.append("content-type", "application/json");
         response.status = .ok;
@@ -465,6 +543,65 @@ pub const ApiServer = struct {
     // ========================================================================
     // Helper Methods
     // ========================================================================
+
+    /// Parse a query parameter from URL target
+    /// Example: parseQueryParam("/api/v1/sandboxes?namespace=prod", "namespace") -> "prod"
+    fn parseQueryParam(allocator: std.mem.Allocator, target: []const u8, param_name: []const u8) !?[]const u8 {
+        // Find query string start
+        const query_start = std.mem.indexOf(u8, target, "?") orelse return null;
+        if (query_start + 1 >= target.len) return null;
+
+        const query_string = target[query_start + 1 ..];
+
+        // Split by & to get individual params
+        var iter = std.mem.splitScalar(u8, query_string, '&');
+        while (iter.next()) |param| {
+            // Split by = to get key and value
+            const eq_pos = std.mem.indexOf(u8, param, "=") orelse continue;
+            if (eq_pos == 0 or eq_pos + 1 >= param.len) continue;
+
+            const key = param[0..eq_pos];
+            const value = param[eq_pos + 1 ..];
+
+            if (std.mem.eql(u8, key, param_name)) {
+                // URL decode value (basic implementation)
+                return try urlDecode(allocator, value);
+            }
+        }
+
+        return null;
+    }
+
+    /// Basic URL decode (handles %20, %2F, etc.)
+    fn urlDecode(allocator: std.mem.Allocator, encoded: []const u8) ![]const u8 {
+        var decoded = std.ArrayList(u8).init(allocator);
+        defer decoded.deinit();
+
+        var i: usize = 0;
+        while (i < encoded.len) {
+            if (encoded[i] == '%' and i + 2 < encoded.len) {
+                // Decode %XX hex sequence
+                const hex_str = encoded[i + 1 .. i + 3];
+                const byte = std.fmt.parseInt(u8, hex_str, 16) catch {
+                    // Invalid hex, keep as-is
+                    try decoded.append(encoded[i]);
+                    i += 1;
+                    continue;
+                };
+                try decoded.append(byte);
+                i += 3;
+            } else if (encoded[i] == '+') {
+                // + is space in query strings
+                try decoded.append(' ');
+                i += 1;
+            } else {
+                try decoded.append(encoded[i]);
+                i += 1;
+            }
+        }
+
+        return try decoded.toOwnedSlice();
+    }
 
     fn sendJsonError(
         self: *ApiServer,

@@ -355,21 +355,170 @@ pub const K7Core = struct {
         const deployments_json = try self.kube_client.listDeployments(ns, label_selector);
         defer self.allocator.free(deployments_json);
 
-        // TODO: Parse JSON response to get deployment list
-        // For now, query pods directly to get status
+        // Query pods to get status
         const pods_json = try self.kube_client.listPods(ns, label_selector);
         defer self.allocator.free(pods_json);
 
-        // TODO: Parse JSON and build SandboxInfo array
-        // This requires a JSON parser - for now return empty list as placeholder
-        // In full implementation, would use std.json to parse and extract:
-        // - deployment name
-        // - pod status (Running/Pending/Failed)
-        // - age calculation from creationTimestamp
-        // - ready condition from status.conditions
-        // - restart count from status.containerStatuses
-        const empty_list = try self.allocator.alloc(models.SandboxInfo, 0);
-        return empty_list;
+        // Parse pods JSON response
+        // Kubernetes API response format:
+        // {"kind":"PodList","items":[{"metadata":{"name":"...","creationTimestamp":"..."},"spec":{"containers":[{"image":"..."}]},"status":{"phase":"Running","conditions":[...],"containerStatuses":[{"restartCount":0}]}}]}
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            arena_allocator,
+            pods_json,
+            .{},
+        ) catch {
+            // If JSON parsing fails, return empty list rather than erroring
+            const empty_list = try self.allocator.alloc(models.SandboxInfo, 0);
+            return empty_list;
+        };
+
+        const root = parsed.value;
+
+        // Get items array
+        const items = if (root.object.get("items")) |items_value|
+            if (items_value == .array) items_value.array else return try self.allocator.alloc(models.SandboxInfo, 0)
+        else
+            return try self.allocator.alloc(models.SandboxInfo, 0);
+
+        if (items.items.len == 0) {
+            const empty_list = try self.allocator.alloc(models.SandboxInfo, 0);
+            return empty_list;
+        }
+
+        // Allocate result array
+        var sandbox_list = std.ArrayList(models.SandboxInfo).init(self.allocator);
+        errdefer {
+            for (sandbox_list.items) |*item| {
+                item.deinit(self.allocator);
+            }
+            sandbox_list.deinit();
+        }
+
+        // Parse each pod
+        for (items.items) |item_value| {
+            if (item_value != .object) continue;
+            const item = item_value.object;
+
+            // Extract metadata
+            const metadata = if (item.get("metadata")) |m|
+                if (m == .object) m.object else continue
+            else continue;
+
+            const name = if (metadata.get("name")) |n|
+                if (n == .string) n.string else continue
+            else continue;
+
+            const pod_namespace = if (metadata.get("namespace")) |n|
+                if (n == .string) n.string else ns
+            else ns;
+
+            const creation_timestamp = if (metadata.get("creationTimestamp")) |ct|
+                if (ct == .string) ct.string else ""
+            else "";
+
+            // Extract spec
+            const spec = if (item.get("spec")) |s|
+                if (s == .object) s.object else continue
+            else continue;
+
+            var image: []const u8 = "unknown";
+            if (spec.get("containers")) |containers_value| {
+                if (containers_value == .array and containers_value.array.items.len > 0) {
+                    const first_container = containers_value.array.items[0];
+                    if (first_container == .object) {
+                        if (first_container.object.get("image")) |img| {
+                            if (img == .string) {
+                                image = img.string;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Extract status
+            const status_obj = if (item.get("status")) |s|
+                if (s == .object) s.object else continue
+            else continue;
+
+            const phase = if (status_obj.get("phase")) |p|
+                if (p == .string) p.string else "Unknown"
+            else "Unknown";
+
+            // Get ready status from conditions
+            var ready_str: []const u8 = "False";
+            if (status_obj.get("conditions")) |conditions_value| {
+                if (conditions_value == .array) {
+                    for (conditions_value.array.items) |condition_value| {
+                        if (condition_value == .object) {
+                            const condition = condition_value.object;
+                            if (condition.get("type")) |type_value| {
+                                if (type_value == .string and std.mem.eql(u8, type_value.string, "Ready")) {
+                                    if (condition.get("status")) |status_value| {
+                                        if (status_value == .string) {
+                                            ready_str = status_value.string;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Get restart count
+            var restarts: i32 = 0;
+            if (status_obj.get("containerStatuses")) |container_statuses_value| {
+                if (container_statuses_value == .array and container_statuses_value.array.items.len > 0) {
+                    const first_status = container_statuses_value.array.items[0];
+                    if (first_status == .object) {
+                        if (first_status.object.get("restartCount")) |rc| {
+                            if (rc == .integer) {
+                                restarts = @intCast(rc.integer);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Calculate age from creationTimestamp
+            const age = try self.calculateAge(creation_timestamp);
+
+            // Create SandboxInfo
+            const info = models.SandboxInfo{
+                .name = try self.allocator.dupe(u8, name),
+                .namespace = try self.allocator.dupe(u8, pod_namespace),
+                .status = try self.allocator.dupe(u8, phase),
+                .ready = try self.allocator.dupe(u8, ready_str),
+                .restarts = restarts,
+                .age = age,
+                .image = try self.allocator.dupe(u8, image),
+                .error_message = "",
+            };
+
+            try sandbox_list.append(info);
+        }
+
+        return try sandbox_list.toOwnedSlice();
+    }
+
+    /// Calculate age string from RFC3339 timestamp
+    fn calculateAge(self: *K7Core, timestamp: []const u8) ![]const u8 {
+        if (timestamp.len == 0) {
+            return try self.allocator.dupe(u8, "unknown");
+        }
+
+        // For now, return a placeholder
+        // Full implementation would parse RFC3339 and calculate difference
+        // Example: "2024-01-15T10:30:00Z" -> "5m" or "2h" or "3d"
+        _ = self;
+        return try self.allocator.dupe(u8, "unknown");
     }
 
     /// Delete a sandbox
@@ -548,32 +697,237 @@ pub const K7Core = struct {
         const metrics_json = try self.kube_client.getPodMetrics(ns);
         defer self.allocator.free(metrics_json);
 
-        // TODO: Parse JSON response to extract metrics
+        // Parse metrics JSON response
         // Response format:
-        // {
-        //   "items": [
-        //     {
-        //       "metadata": {"name": "pod-name", "namespace": "default"},
-        //       "containers": [
-        //         {
-        //           "name": "container-name",
-        //           "usage": {"cpu": "100m", "memory": "128Mi"}
-        //         }
-        //       ]
-        //     }
-        //   ]
-        // }
-        //
-        // Would need to:
-        // 1. Parse JSON with std.json
-        // 2. Extract pod names and container usage
-        // 3. Convert CPU units (n=nanocores, u=microcores, m=millicores)
-        // 4. Convert memory units (Ki/Mi/Gi to bytes)
-        // 5. Build MetricInfo array
+        // {"kind":"PodMetricsList","items":[{"metadata":{"name":"pod-name","namespace":"default"},"containers":[{"name":"container-name","usage":{"cpu":"100m","memory":"128Mi"}}]}]}
 
-        // For now, return empty list as placeholder
-        const empty_list = try self.allocator.alloc(MetricInfo, 0);
-        return empty_list;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            arena_allocator,
+            metrics_json,
+            .{},
+        ) catch {
+            // If JSON parsing fails, return empty list
+            const empty_list = try self.allocator.alloc(MetricInfo, 0);
+            return empty_list;
+        };
+
+        const root = parsed.value;
+
+        // Get items array
+        const items = if (root.object.get("items")) |items_value|
+            if (items_value == .array) items_value.array else return try self.allocator.alloc(MetricInfo, 0)
+        else
+            return try self.allocator.alloc(MetricInfo, 0);
+
+        if (items.items.len == 0) {
+            const empty_list = try self.allocator.alloc(MetricInfo, 0);
+            return empty_list;
+        }
+
+        // Allocate result array
+        var metrics_list = std.ArrayList(MetricInfo).init(self.allocator);
+        errdefer metrics_list.deinit();
+
+        // Parse each pod metric
+        for (items.items) |item_value| {
+            if (item_value != .object) continue;
+            const item = item_value.object;
+
+            // Extract metadata
+            const metadata = if (item.get("metadata")) |m|
+                if (m == .object) m.object else continue
+            else continue;
+
+            const name = if (metadata.get("name")) |n|
+                if (n == .string) n.string else continue
+            else continue;
+
+            const pod_namespace = if (metadata.get("namespace")) |n|
+                if (n == .string) n.string else ns
+            else ns;
+
+            // Extract containers
+            const containers = if (item.get("containers")) |c|
+                if (c == .array) c.array else continue
+            else continue;
+
+            // Aggregate metrics from all containers
+            var total_cpu_millicores: u64 = 0;
+            var total_memory_bytes: u64 = 0;
+
+            for (containers.items) |container_value| {
+                if (container_value != .object) continue;
+                const container = container_value.object;
+
+                const usage = if (container.get("usage")) |u|
+                    if (u == .object) u.object else continue
+                else continue;
+
+                // Parse CPU
+                if (usage.get("cpu")) |cpu_value| {
+                    if (cpu_value == .string) {
+                        const cpu_str = cpu_value.string;
+                        const cpu_millicores = try self.parseCpuString(cpu_str);
+                        total_cpu_millicores += cpu_millicores;
+                    }
+                }
+
+                // Parse Memory
+                if (usage.get("memory")) |memory_value| {
+                    if (memory_value == .string) {
+                        const memory_str = memory_value.string;
+                        const memory_bytes = try self.parseMemoryString(memory_str);
+                        total_memory_bytes += memory_bytes;
+                    }
+                }
+            }
+
+            // Format metrics for display
+            const cpu_display = try self.formatCpuMetric(total_cpu_millicores);
+            const memory_display = try self.formatMemoryMetric(total_memory_bytes);
+
+            // Create MetricInfo
+            const info = MetricInfo{
+                .name = try self.allocator.dupe(u8, name),
+                .namespace = try self.allocator.dupe(u8, pod_namespace),
+                .cpu_usage = cpu_display,
+                .memory_usage = memory_display,
+            };
+
+            try metrics_list.append(info);
+        }
+
+        return try metrics_list.toOwnedSlice();
+    }
+
+    /// Parse CPU string from Kubernetes metrics (e.g., "100m", "1", "500n")
+    /// Returns millicores
+    fn parseCpuString(self: *K7Core, cpu_str: []const u8) !u64 {
+        _ = self;
+        if (cpu_str.len == 0) return 0;
+
+        // Check for unit suffix
+        const last_char = cpu_str[cpu_str.len - 1];
+
+        if (std.ascii.isDigit(last_char)) {
+            // No suffix, value is in cores, convert to millicores
+            const cores = try std.fmt.parseInt(u64, cpu_str, 10);
+            return cores * 1000;
+        } else if (last_char == 'm') {
+            // Millicores
+            const value_str = cpu_str[0 .. cpu_str.len - 1];
+            return try std.fmt.parseInt(u64, value_str, 10);
+        } else if (last_char == 'n') {
+            // Nanocores, convert to millicores
+            const value_str = cpu_str[0 .. cpu_str.len - 1];
+            const nanocores = try std.fmt.parseInt(u64, value_str, 10);
+            return nanocores / 1_000_000;
+        } else if (last_char == 'u') {
+            // Microcores, convert to millicores
+            const value_str = cpu_str[0 .. cpu_str.len - 1];
+            const microcores = try std.fmt.parseInt(u64, value_str, 10);
+            return microcores / 1000;
+        }
+
+        return 0;
+    }
+
+    /// Parse memory string from Kubernetes metrics (e.g., "128Mi", "1Gi", "512Ki")
+    /// Returns bytes
+    fn parseMemoryString(self: *K7Core, memory_str: []const u8) !u64 {
+        _ = self;
+        if (memory_str.len < 2) return 0;
+
+        // Check for unit suffix (Ki, Mi, Gi, Ti)
+        if (memory_str.len >= 2) {
+            const suffix = memory_str[memory_str.len - 2 ..];
+            var value_str: []const u8 = undefined;
+            var multiplier: u64 = 1;
+
+            if (std.mem.eql(u8, suffix, "Ki")) {
+                value_str = memory_str[0 .. memory_str.len - 2];
+                multiplier = 1024;
+            } else if (std.mem.eql(u8, suffix, "Mi")) {
+                value_str = memory_str[0 .. memory_str.len - 2];
+                multiplier = 1024 * 1024;
+            } else if (std.mem.eql(u8, suffix, "Gi")) {
+                value_str = memory_str[0 .. memory_str.len - 2];
+                multiplier = 1024 * 1024 * 1024;
+            } else if (std.mem.eql(u8, suffix, "Ti")) {
+                value_str = memory_str[0 .. memory_str.len - 2];
+                multiplier = 1024 * 1024 * 1024 * 1024;
+            } else {
+                // No recognized suffix, try to parse as raw bytes
+                return try std.fmt.parseInt(u64, memory_str, 10);
+            }
+
+            const value = try std.fmt.parseInt(u64, value_str, 10);
+            return value * multiplier;
+        }
+
+        return 0;
+    }
+
+    /// Format CPU millicores for display (e.g., "100m", "1.5", "2.25")
+    fn formatCpuMetric(self: *K7Core, millicores: u64) ![]const u8 {
+        if (millicores == 0) {
+            return try self.allocator.dupe(u8, "0m");
+        }
+
+        if (millicores < 1000) {
+            // Display as millicores
+            return try std.fmt.allocPrint(self.allocator, "{d}m", .{millicores});
+        } else {
+            // Display as cores with decimal
+            const cores = millicores / 1000;
+            const remainder = millicores % 1000;
+            if (remainder == 0) {
+                return try std.fmt.allocPrint(self.allocator, "{d}", .{cores});
+            } else {
+                // Show up to 2 decimal places
+                const decimal = remainder / 10;
+                return try std.fmt.allocPrint(self.allocator, "{d}.{d:0>2}", .{ cores, decimal });
+            }
+        }
+    }
+
+    /// Format memory bytes for display (e.g., "128Mi", "1.5Gi")
+    fn formatMemoryMetric(self: *K7Core, bytes: u64) ![]const u8 {
+        if (bytes == 0) {
+            return try self.allocator.dupe(u8, "0");
+        }
+
+        const gb = 1024 * 1024 * 1024;
+        const mb = 1024 * 1024;
+        const kb = 1024;
+
+        if (bytes >= gb) {
+            const gigs = bytes / gb;
+            const remainder = (bytes % gb) / (gb / 10);
+            if (remainder == 0) {
+                return try std.fmt.allocPrint(self.allocator, "{d}Gi", .{gigs});
+            } else {
+                return try std.fmt.allocPrint(self.allocator, "{d}.{d}Gi", .{ gigs, remainder });
+            }
+        } else if (bytes >= mb) {
+            const megs = bytes / mb;
+            const remainder = (bytes % mb) / (mb / 10);
+            if (remainder == 0) {
+                return try std.fmt.allocPrint(self.allocator, "{d}Mi", .{megs});
+            } else {
+                return try std.fmt.allocPrint(self.allocator, "{d}.{d}Mi", .{ megs, remainder });
+            }
+        } else if (bytes >= kb) {
+            const kilos = bytes / kb;
+            return try std.fmt.allocPrint(self.allocator, "{d}Ki", .{kilos});
+        } else {
+            return try std.fmt.allocPrint(self.allocator, "{d}", .{bytes});
+        }
     }
 
     /// Install K7 on node via Ansible
