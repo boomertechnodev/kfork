@@ -32,7 +32,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .version = version,
     });
-    k7_cli.linkLibrary(k7core);
     b.installArtifact(k7_cli);
 
     //
@@ -45,7 +44,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .version = version,
     });
-    k7_api.linkLibrary(k7core);
     b.installArtifact(k7_api);
 
     //
@@ -58,7 +56,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .version = version,
     });
-    k7sdk.linkLibrary(k7core);
     k7sdk.linkLibC();
     b.installArtifact(k7sdk);
 
