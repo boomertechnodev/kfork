@@ -126,7 +126,25 @@ pub const ApiServer = struct {
                     continue;
                 };
 
-                try self.handleRequest(&response);
+                // Handle request with logging
+                const start_time = std.time.milliTimestamp();
+                self.handleRequest(&response) catch |err| {
+                    const stdout_err = std.io.getStdOut().writer();
+                    stdout_err.print("Error handling request: {}\n", .{err}) catch {};
+                };
+                const duration = std.time.milliTimestamp() - start_time;
+
+                // Log request completion (method, target, status, duration)
+                const stdout_log = std.io.getStdOut().writer();
+                const status_code = @intFromEnum(response.status);
+                const method_str = @tagName(response.request.method);
+                stdout_log.print("[{d}] {s} {s} - {d} ({d}ms)\n", .{
+                    std.time.timestamp(),
+                    method_str,
+                    response.request.target,
+                    status_code,
+                    duration,
+                }) catch {};
             }
         }
     }
@@ -134,10 +152,6 @@ pub const ApiServer = struct {
     fn handleRequest(self: *ApiServer, response: *std.http.Server.Response) !void {
         const method = response.request.method;
         const target = response.request.target;
-
-        // Log request
-        const stdout = std.io.getStdOut().writer();
-        try stdout.print("{s} {s}\n", .{ @tagName(method), target });
 
         // Authenticate (except for health and root endpoints)
         if (!std.mem.eql(u8, target, "/") and !std.mem.eql(u8, target, "/health")) {
@@ -200,11 +214,69 @@ pub const ApiServer = struct {
     }
 
     fn handleHealth(self: *ApiServer, response: *std.http.Server.Response) !void {
-        _ = self;
-        const body = "{\"status\":\"healthy\"}";
+        // Perform actual health checks
+        var checks = std.StringHashMap([]const u8).init(self.allocator);
+        defer {
+            var it = checks.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.value_ptr.*);
+            }
+            checks.deinit();
+        }
+
+        var overall_healthy = true;
+
+        // Check 1: Kubernetes API connectivity
+        const k8s_status = blk: {
+            // Try to list namespaces to verify connectivity
+            const label_selector = "managed-by=k7";
+            _ = self.k7_core.listSandboxes(null) catch {
+                overall_healthy = false;
+                break :blk try self.allocator.dupe(u8, "error");
+            };
+            break :blk try self.allocator.dupe(u8, "ok");
+        };
+        try checks.put("kubernetes", k8s_status);
+
+        // Check 2: Metrics API availability (optional)
+        const metrics_status = blk: {
+            _ = self.k7_core.getSandboxMetrics(null) catch {
+                // Metrics API is optional, don't fail overall health
+                break :blk try self.allocator.dupe(u8, "unavailable");
+            };
+            break :blk try self.allocator.dupe(u8, "ok");
+        };
+        try checks.put("metrics_api", metrics_status);
+
+        // Build response JSON
+        var json_builder = std.ArrayList(u8).init(self.allocator);
+        defer json_builder.deinit();
+
+        const status_str = if (overall_healthy) "healthy" else "unhealthy";
+        try json_builder.appendSlice("{\"status\":\"");
+        try json_builder.appendSlice(status_str);
+        try json_builder.appendSlice("\",\"checks\":{");
+
+        var first = true;
+        var it = checks.iterator();
+        while (it.next()) |entry| {
+            if (!first) try json_builder.append(',');
+            first = false;
+
+            try json_builder.append('"');
+            try json_builder.appendSlice(entry.key_ptr.*);
+            try json_builder.appendSlice("\":\"");
+            try json_builder.appendSlice(entry.value_ptr.*);
+            try json_builder.append('"');
+        }
+
+        try json_builder.appendSlice("}}");
+
+        const body = try json_builder.toOwnedSlice();
+        defer self.allocator.free(body);
 
         try response.headers.append("content-type", "application/json");
-        response.status = .ok;
+        response.status = if (overall_healthy) .ok else .service_unavailable;
         try response.do();
         try response.writeAll(body);
         try response.finish();
