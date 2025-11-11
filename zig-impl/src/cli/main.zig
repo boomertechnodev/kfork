@@ -1,5 +1,6 @@
 const std = @import("std");
 const models = @import("../core/models.zig");
+const core = @import("../core/core.zig");
 
 const K7_VERSION = "0.0.3";
 
@@ -108,87 +109,391 @@ fn cmdInstall(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype,
 }
 
 fn cmdCreate(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = args;
-    _ = stderr;
+    // Parse arguments: --config <file> or inline args
+    var config_file: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+    var image: ?[]const u8 = null;
+    var namespace: []const u8 = "default";
 
-    // Example: Create a sandbox from hardcoded config
-    var config = models.SandboxConfig{
-        .name = "example-sandbox",
-        .image = "alpine:latest",
-        .namespace = "default",
-        .env_file = null,
-        .egress_whitelist = null,
-        .limits = null,
-        .before_script = "",
-        .pod_non_root = false,
-        .container_non_root = false,
-        .cap_drop = null,
-        .cap_add = null,
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+            if (i + 1 >= args.len) {
+                try stderr.writeAll("Error: --config requires a file path\n");
+                return error.MissingArgument;
+            }
+            config_file = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--name") or std.mem.eql(u8, arg, "-n")) {
+            if (i + 1 >= args.len) {
+                try stderr.writeAll("Error: --name requires a value\n");
+                return error.MissingArgument;
+            }
+            name = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--image") or std.mem.eql(u8, arg, "-i")) {
+            if (i + 1 >= args.len) {
+                try stderr.writeAll("Error: --image requires a value\n");
+                return error.MissingArgument;
+            }
+            image = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--namespace") or std.mem.eql(u8, arg, "-ns")) {
+            if (i + 1 >= args.len) {
+                try stderr.writeAll("Error: --namespace requires a value\n");
+                return error.MissingArgument;
+            }
+            namespace = args[i + 1];
+            i += 1;
+        }
+    }
+
+    var config: models.SandboxConfig = undefined;
+
+    if (config_file) |file_path| {
+        // Load from YAML/JSON file
+        const file_content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch |err| {
+            try stderr.print("Error reading config file: {s}\n", .{@errorName(err)});
+            return error.FileReadFailed;
+        };
+        defer allocator.free(file_content);
+
+        // TODO: Parse YAML (requires external library)
+        // For now, try JSON
+        config = models.SandboxConfig.fromJson(allocator, file_content) catch |err| {
+            try stderr.print("Error parsing config: {s}\n", .{@errorName(err)});
+            return error.ConfigParseFailed;
+        };
+    } else {
+        // Create from CLI arguments
+        if (name == null or image == null) {
+            try stderr.writeAll("Error: --name and --image are required\n");
+            return error.MissingArgument;
+        }
+
+        config = models.SandboxConfig{
+            .name = name.?,
+            .image = image.?,
+            .namespace = namespace,
+            .env_file = null,
+            .egress_whitelist = null,
+            .limits = null,
+            .before_script = "",
+            .pod_non_root = true,
+            .container_non_root = true,
+            .cap_drop = null,
+            .cap_add = null,
+        };
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    // Progress callback
+    const ProgressCallback = struct {
+        fn callback(event: core.ProgressEvent) void {
+            const out = std.io.getStdOut().writer();
+            out.print("[{s}] {s}", .{ event.stage, event.status }) catch {};
+            if (event.message) |msg| {
+                out.print(": {s}", .{msg}) catch {};
+            }
+            out.writeAll("\n") catch {};
+        }
     };
 
-    // Validate config
-    try config.validate();
+    try stdout.print("Creating sandbox '{s}'...\n", .{config.name});
 
-    // Convert to JSON to show serialization
-    const json = try config.toJson(allocator);
-    defer allocator.free(json);
+    // Create sandbox
+    const result = k7_core.createSandbox(config, ProgressCallback.callback) catch |err| {
+        try stderr.print("Error creating sandbox: {s}\n", .{@errorName(err)});
+        return error.CreateFailed;
+    };
+    defer result.deinit(allocator);
 
-    try stdout.print("Creating sandbox with config:\n{s}\n", .{json});
-    try stdout.writeAll("TODO: Implement full sandbox creation with K7Core\n");
+    if (result.success) {
+        try stdout.print("✓ Sandbox created successfully: {s}\n", .{result.message});
+    } else {
+        try stderr.print("✗ Failed to create sandbox: {s}\n", .{result.err});
+        return error.CreateFailed;
+    }
 }
 
 fn cmdList(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = allocator;
-    _ = args;
-    _ = stderr;
-    try stdout.writeAll("TODO: Implement list command (query Kubernetes API)\n");
+    // Parse namespace from args
+    var namespace: ?[]const u8 = null;
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--namespace")) {
+        if (args.len < 2) {
+            try stderr.writeAll("Error: --namespace requires a value\n");
+            return error.MissingArgument;
+        }
+        namespace = args[1];
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    // List sandboxes
+    const sandboxes = k7_core.listSandboxes(namespace) catch |err| {
+        try stderr.print("Error listing sandboxes: {s}\n", .{@errorName(err)});
+        return error.ListFailed;
+    };
+    defer allocator.free(sandboxes);
+
+    if (sandboxes.len == 0) {
+        try stdout.writeAll("No sandboxes found.\n");
+        return;
+    }
+
+    // Print table header
+    try stdout.writeAll("NAME                    NAMESPACE    STATUS      AGE\n");
+    try stdout.writeAll("----                    ---------    ------      ---\n");
+
+    // Print each sandbox
+    for (sandboxes) |sandbox| {
+        try stdout.print("{s:<23} {s:<12} {s:<11} {s}\n", .{
+            sandbox.name,
+            sandbox.namespace,
+            sandbox.status,
+            sandbox.age,
+        });
+    }
 }
 
 fn cmdDelete(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = allocator;
-    _ = stderr;
-
     if (args.len < 1) {
+        try stderr.writeAll("Error: sandbox name is required\n");
         return error.MissingArgument;
     }
 
     const name = args[0];
-    try stdout.print("TODO: Implement delete for sandbox: {s}\n", .{name});
+    var namespace: []const u8 = "default";
+
+    // Check for --namespace flag
+    if (args.len > 2 and std.mem.eql(u8, args[1], "--namespace")) {
+        namespace = args[2];
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    try stdout.print("Deleting sandbox '{s}' in namespace '{s}'...\n", .{ name, namespace });
+
+    // Delete sandbox
+    const result = k7_core.deleteSandbox(name, namespace) catch |err| {
+        try stderr.print("Error deleting sandbox: {s}\n", .{@errorName(err)});
+        return error.DeleteFailed;
+    };
+    defer result.deinit(allocator);
+
+    if (result.success) {
+        try stdout.print("✓ Sandbox deleted successfully\n", .{});
+    } else {
+        try stderr.print("✗ Failed to delete sandbox: {s}\n", .{result.err});
+        return error.DeleteFailed;
+    }
 }
 
 fn cmdDeleteAll(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = allocator;
-    _ = args;
-    _ = stderr;
-    try stdout.writeAll("TODO: Implement delete-all command\n");
+    var namespace: []const u8 = "default";
+
+    // Check for --namespace flag
+    if (args.len > 1 and std.mem.eql(u8, args[0], "--namespace")) {
+        namespace = args[1];
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    try stdout.print("Deleting all sandboxes in namespace '{s}'...\n", .{namespace});
+
+    // Delete all sandboxes
+    const result = k7_core.deleteAllSandboxes(namespace) catch |err| {
+        try stderr.print("Error deleting sandboxes: {s}\n", .{@errorName(err)});
+        return error.DeleteFailed;
+    };
+    defer result.deinit(allocator);
+
+    if (result.success) {
+        try stdout.print("✓ All sandboxes deleted successfully\n", .{});
+    } else {
+        try stderr.print("✗ Failed to delete sandboxes: {s}\n", .{result.err});
+        return error.DeleteFailed;
+    }
 }
 
 fn cmdShell(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = allocator;
-    _ = args;
-    _ = stderr;
-    try stdout.writeAll("TODO: Implement shell command (kubectl exec wrapper)\n");
+    if (args.len < 1) {
+        try stderr.writeAll("Error: sandbox name is required\n");
+        return error.MissingArgument;
+    }
+
+    const name = args[0];
+    var namespace: []const u8 = "default";
+
+    if (args.len > 2 and std.mem.eql(u8, args[1], "--namespace")) {
+        namespace = args[2];
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    try stdout.print("Opening shell in sandbox '{s}'...\n", .{name});
+
+    // Execute /bin/sh
+    const result = k7_core.execCommand(name, "/bin/sh", namespace) catch |err| {
+        try stderr.print("Error opening shell: {s}\n", .{@errorName(err)});
+        return error.ShellFailed;
+    };
+    defer result.deinit(allocator);
+
+    // Print stdout and stderr
+    if (result.stdout.len > 0) {
+        try stdout.print("{s}", .{result.stdout});
+    }
+    if (result.stderr.len > 0) {
+        try stderr.print("{s}", .{result.stderr});
+    }
+
+    if (result.exit_code != 0) {
+        try stderr.print("Shell exited with code: {d}\n", .{result.exit_code});
+    }
 }
 
 fn cmdLogs(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = allocator;
-    _ = args;
-    _ = stderr;
-    try stdout.writeAll("TODO: Implement logs command (kubectl logs wrapper)\n");
+    if (args.len < 1) {
+        try stderr.writeAll("Error: sandbox name is required\n");
+        return error.MissingArgument;
+    }
+
+    const name = args[0];
+    var namespace: []const u8 = "default";
+
+    if (args.len > 2 and std.mem.eql(u8, args[1], "--namespace")) {
+        namespace = args[2];
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    // Get logs via exec command
+    const result = k7_core.execCommand(name, "cat /proc/1/fd/1", namespace) catch |err| {
+        try stderr.print("Error getting logs: {s}\n", .{@errorName(err)});
+        return error.LogsFailed;
+    };
+    defer result.deinit(allocator);
+
+    // Print logs
+    if (result.stdout.len > 0) {
+        try stdout.print("{s}", .{result.stdout});
+    }
 }
 
 fn cmdTop(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
-    _ = allocator;
-    _ = args;
-    _ = stderr;
-    try stdout.writeAll("TODO: Implement top command (live metrics display)\n");
+    var namespace: ?[]const u8 = null;
+
+    if (args.len > 1 and std.mem.eql(u8, args[0], "--namespace")) {
+        namespace = args[1];
+    }
+
+    // Initialize K7Core
+    const kubeconfig = std.os.getenv("KUBECONFIG");
+    var k7_core = core.K7Core.init(allocator, kubeconfig) catch |err| {
+        try stderr.print("Error initializing K7Core: {s}\n", .{@errorName(err)});
+        return error.InitFailed;
+    };
+    defer k7_core.deinit();
+
+    // Get metrics
+    const metrics = k7_core.getSandboxMetrics(namespace) catch |err| {
+        try stderr.print("Error getting metrics: {s}\n", .{@errorName(err)});
+        return error.TopFailed;
+    };
+    defer allocator.free(metrics);
+
+    if (metrics.len == 0) {
+        try stdout.writeAll("No sandboxes found.\n");
+        return;
+    }
+
+    // Print table header
+    try stdout.writeAll("NAME                    NAMESPACE    CPU         MEMORY\n");
+    try stdout.writeAll("----                    ---------    ---         ------\n");
+
+    // Print each metric
+    for (metrics) |metric| {
+        try stdout.print("{s:<23} {s:<12} {s:<11} {s}\n", .{
+            metric.name,
+            metric.namespace,
+            metric.cpu_usage,
+            metric.memory_usage,
+        });
+    }
 }
 
 fn cmdGenerateApiKey(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
+    if (args.len < 1) {
+        try stderr.writeAll("Error: key name is required\n");
+        return error.MissingArgument;
+    }
+
+    const key_name = args[0];
+
+    // Generate random API key (32 bytes = 64 hex chars)
+    var random_bytes: [32]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+
+    // Convert to hex string
+    var api_key_buf: [64]u8 = undefined;
+    const api_key = std.fmt.bufPrint(&api_key_buf, "{}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;
+
+    // Compute SHA256 hash for storage
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(api_key);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+
+    var hash_buf: [64]u8 = undefined;
+    const hash_hex = std.fmt.bufPrint(&hash_buf, "{}", .{std.fmt.fmtSliceHexLower(&digest)}) catch unreachable;
+
+    try stdout.print("Generated API key for '{s}':\n\n", .{key_name});
+    try stdout.print("API Key: {s}\n", .{api_key});
+    try stdout.print("SHA256:  {s}\n\n", .{hash_hex});
+    try stdout.writeAll("⚠️  Save this API key securely - it cannot be recovered!\n");
+    try stdout.writeAll("💾 Store the SHA256 hash in your API key database.\n");
+
+    // TODO: Optionally save to config file
     _ = allocator;
-    _ = args;
-    _ = stderr;
-    try stdout.writeAll("TODO: Implement generate-api-key command (cryptographic random + Argon2id)\n");
 }
 
 fn cmdListApiKeys(allocator: std.mem.Allocator, args: [][]const u8, stdout: anytype, stderr: anytype) !void {
