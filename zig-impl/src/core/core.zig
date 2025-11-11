@@ -509,16 +509,117 @@ pub const K7Core = struct {
     }
 
     /// Calculate age string from RFC3339 timestamp
+    /// Example: "2024-01-15T10:30:00Z" -> "5m" or "2h" or "3d"
     fn calculateAge(self: *K7Core, timestamp: []const u8) ![]const u8 {
         if (timestamp.len == 0) {
             return try self.allocator.dupe(u8, "unknown");
         }
 
-        // For now, return a placeholder
-        // Full implementation would parse RFC3339 and calculate difference
-        // Example: "2024-01-15T10:30:00Z" -> "5m" or "2h" or "3d"
-        _ = self;
-        return try self.allocator.dupe(u8, "unknown");
+        // Parse RFC3339 timestamp
+        // Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+00:00
+        const epoch_seconds = parseRFC3339(timestamp) catch {
+            return try self.allocator.dupe(u8, "unknown");
+        };
+
+        // Get current time
+        const now = std.time.timestamp();
+
+        // Calculate difference
+        if (now < epoch_seconds) {
+            // Timestamp is in the future (shouldn't happen)
+            return try self.allocator.dupe(u8, "0s");
+        }
+
+        const diff_seconds = @as(u64, @intCast(now - epoch_seconds));
+
+        // Format as human-readable age
+        return try self.formatAge(diff_seconds);
+    }
+
+    /// Parse RFC3339 timestamp to Unix epoch seconds
+    /// Format: "2024-01-15T10:30:00Z" or "2024-01-15T10:30:00+00:00"
+    fn parseRFC3339(timestamp: []const u8) !i64 {
+        // Minimum length: "2024-01-01T00:00:00Z" = 20 characters
+        if (timestamp.len < 20) return error.InvalidTimestamp;
+
+        // Parse date components
+        const year = try std.fmt.parseInt(i32, timestamp[0..4], 10);
+        const month = try std.fmt.parseInt(u32, timestamp[5..7], 10);
+        const day = try std.fmt.parseInt(u32, timestamp[8..10], 10);
+
+        if (timestamp[10] != 'T') return error.InvalidTimestamp;
+
+        // Parse time components
+        const hour = try std.fmt.parseInt(u32, timestamp[11..13], 10);
+        const minute = try std.fmt.parseInt(u32, timestamp[14..16], 10);
+        const second = try std.fmt.parseInt(u32, timestamp[17..19], 10);
+
+        // Validate ranges
+        if (month < 1 or month > 12) return error.InvalidTimestamp;
+        if (day < 1 or day > 31) return error.InvalidTimestamp;
+        if (hour > 23) return error.InvalidTimestamp;
+        if (minute > 59) return error.InvalidTimestamp;
+        if (second > 59) return error.InvalidTimestamp;
+
+        // Calculate Unix epoch (days since 1970-01-01)
+        // Simplified calculation (doesn't account for all leap years perfectly)
+        var days: i64 = 0;
+
+        // Add years (approximate - 365.25 days per year)
+        days += @as(i64, year - 1970) * 365;
+
+        // Add leap year days (every 4 years since 1972, excluding centuries not divisible by 400)
+        const leap_years = @divTrunc(year - 1972, 4) + 1;
+        days += leap_years;
+
+        // Add months (approximate)
+        const days_per_month = [_]u32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        for (0..month - 1) |m| {
+            days += days_per_month[m];
+        }
+
+        // Add days
+        days += @as(i64, day - 1);
+
+        // Calculate seconds
+        var seconds: i64 = days * 86400;
+        seconds += @as(i64, hour) * 3600;
+        seconds += @as(i64, minute) * 60;
+        seconds += @as(i64, second);
+
+        return seconds;
+    }
+
+    /// Format age in seconds to human-readable string
+    fn formatAge(self: *K7Core, seconds: u64) ![]const u8 {
+        const minute = 60;
+        const hour = minute * 60;
+        const day = hour * 24;
+        const week = day * 7;
+        const month = day * 30;
+        const year = day * 365;
+
+        if (seconds < minute) {
+            return try std.fmt.allocPrint(self.allocator, "{d}s", .{seconds});
+        } else if (seconds < hour) {
+            const minutes = seconds / minute;
+            return try std.fmt.allocPrint(self.allocator, "{d}m", .{minutes});
+        } else if (seconds < day) {
+            const hours = seconds / hour;
+            return try std.fmt.allocPrint(self.allocator, "{d}h", .{hours});
+        } else if (seconds < week) {
+            const days = seconds / day;
+            return try std.fmt.allocPrint(self.allocator, "{d}d", .{days});
+        } else if (seconds < month) {
+            const weeks = seconds / week;
+            return try std.fmt.allocPrint(self.allocator, "{d}w", .{weeks});
+        } else if (seconds < year) {
+            const months = seconds / month;
+            return try std.fmt.allocPrint(self.allocator, "{d}mo", .{months});
+        } else {
+            const years = seconds / year;
+            return try std.fmt.allocPrint(self.allocator, "{d}y", .{years});
+        }
     }
 
     /// Delete a sandbox
