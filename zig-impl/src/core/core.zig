@@ -334,12 +334,104 @@ pub const K7Core = struct {
             const pods_json = try self.kube_client.listPods(namespace, label_selector);
             defer self.allocator.free(pods_json);
 
-            // TODO: Parse JSON and check if pod is ready
-            // For now, sleep and retry
-            std.time.sleep(2 * std.time.ns_per_s); // 2 seconds
+            // Parse JSON to check if pod is ready
+            // Kubernetes API response format:
+            // {"kind":"PodList","items":[{"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
 
-            // Placeholder: assume ready after 10 seconds
-            if (elapsed > 10) break;
+            const parsed = std.json.parseFromSlice(
+                std.json.Value,
+                arena_allocator,
+                pods_json,
+                .{},
+            ) catch {
+                // If JSON parsing fails, wait and retry
+                std.time.sleep(2 * std.time.ns_per_s);
+                continue;
+            };
+
+            const root = parsed.value;
+
+            // Get items array
+            const items = if (root.object.get("items")) |items_value|
+                if (items_value == .array) items_value.array else {
+                    std.time.sleep(2 * std.time.ns_per_s);
+                    continue;
+                }
+            else {
+                std.time.sleep(2 * std.time.ns_per_s);
+                continue;
+            };
+
+            // Check if we have at least one pod
+            if (items.items.len == 0) {
+                // No pods yet, wait and retry
+                std.time.sleep(2 * std.time.ns_per_s);
+                continue;
+            }
+
+            // Check the first pod's ready status
+            const first_pod = items.items[0];
+            if (first_pod != .object) {
+                std.time.sleep(2 * std.time.ns_per_s);
+                continue;
+            }
+
+            const pod = first_pod.object;
+
+            // Get status object
+            const status_obj = if (pod.get("status")) |s|
+                if (s == .object) s.object else {
+                    std.time.sleep(2 * std.time.ns_per_s);
+                    continue;
+                }
+            else {
+                std.time.sleep(2 * std.time.ns_per_s);
+                continue;
+            };
+
+            // Check conditions array for Ready condition
+            const conditions = if (status_obj.get("conditions")) |c|
+                if (c == .array) c.array else {
+                    std.time.sleep(2 * std.time.ns_per_s);
+                    continue;
+                }
+            else {
+                std.time.sleep(2 * std.time.ns_per_s);
+                continue;
+            };
+
+            // Look for Ready condition with status=True
+            var is_ready = false;
+            for (conditions.items) |condition_value| {
+                if (condition_value != .object) continue;
+                const condition = condition_value.object;
+
+                const condition_type = if (condition.get("type")) |t|
+                    if (t == .string) t.string else continue
+                else continue;
+
+                if (std.mem.eql(u8, condition_type, "Ready")) {
+                    const condition_status = if (condition.get("status")) |s|
+                        if (s == .string) s.string else "False"
+                    else "False";
+
+                    if (std.mem.eql(u8, condition_status, "True")) {
+                        is_ready = true;
+                        break;
+                    }
+                }
+            }
+
+            if (is_ready) {
+                // Pod is ready!
+                return;
+            } else {
+                // Not ready yet, wait and retry
+                std.time.sleep(2 * std.time.ns_per_s);
+            }
         }
     }
 
@@ -727,16 +819,164 @@ pub const K7Core = struct {
     ) !models.ExecResult {
         const start_time = std.time.milliTimestamp();
 
-        // Step 1: Find pod for deployment
+        // Step 1: Find pod for deployment by parsing pods JSON
         const label_selector = try std.fmt.allocPrint(self.allocator, "app={s}", .{sandbox_name});
         defer self.allocator.free(label_selector);
 
         const pods_json = try self.kube_client.listPods(namespace, label_selector);
         defer self.allocator.free(pods_json);
 
-        // TODO: Parse JSON to get pod name
-        // For now, construct expected pod name
-        // In real implementation, would parse pods_json to get actual pod name
+        // Parse JSON to get actual pod name
+        // Kubernetes API response format:
+        // {"kind":"PodList","items":[{"metadata":{"name":"actual-pod-name"}}]}
+        const pod_name = blk: {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
+
+            const parsed = std.json.parseFromSlice(
+                std.json.Value,
+                arena_allocator,
+                pods_json,
+                .{},
+            ) catch {
+                const stderr_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Failed to parse pods JSON response",
+                    .{},
+                );
+                return models.ExecResult{
+                    .exit_code = 1,
+                    .stdout = try self.allocator.dupe(u8, ""),
+                    .stderr = stderr_msg,
+                    .duration_ms = std.time.milliTimestamp() - start_time,
+                };
+            };
+
+            const root = parsed.value;
+
+            // Get items array
+            const items = if (root.object.get("items")) |items_value|
+                if (items_value == .array) items_value.array else {
+                    const stderr_msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Invalid pods response: missing items array",
+                        .{},
+                    );
+                    return models.ExecResult{
+                        .exit_code = 1,
+                        .stdout = try self.allocator.dupe(u8, ""),
+                        .stderr = stderr_msg,
+                        .duration_ms = std.time.milliTimestamp() - start_time,
+                    };
+                }
+            else {
+                const stderr_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Invalid pods response: missing items field",
+                    .{},
+                );
+                return models.ExecResult{
+                    .exit_code = 1,
+                    .stdout = try self.allocator.dupe(u8, ""),
+                    .stderr = stderr_msg,
+                    .duration_ms = std.time.milliTimestamp() - start_time,
+                };
+            };
+
+            // Check if we have at least one pod
+            if (items.items.len == 0) {
+                const stderr_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "No pods found for sandbox '{s}'",
+                    .{sandbox_name},
+                );
+                return models.ExecResult{
+                    .exit_code = 1,
+                    .stdout = try self.allocator.dupe(u8, ""),
+                    .stderr = stderr_msg,
+                    .duration_ms = std.time.milliTimestamp() - start_time,
+                };
+            }
+
+            // Get first pod's metadata
+            const first_pod = items.items[0];
+            if (first_pod != .object) {
+                const stderr_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Invalid pod object in response",
+                    .{},
+                );
+                return models.ExecResult{
+                    .exit_code = 1,
+                    .stdout = try self.allocator.dupe(u8, ""),
+                    .stderr = stderr_msg,
+                    .duration_ms = std.time.milliTimestamp() - start_time,
+                };
+            }
+
+            const pod = first_pod.object;
+
+            const metadata = if (pod.get("metadata")) |m|
+                if (m == .object) m.object else {
+                    const stderr_msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Invalid pod metadata",
+                        .{},
+                    );
+                    return models.ExecResult{
+                        .exit_code = 1,
+                        .stdout = try self.allocator.dupe(u8, ""),
+                        .stderr = stderr_msg,
+                        .duration_ms = std.time.milliTimestamp() - start_time,
+                    };
+                }
+            else {
+                const stderr_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Missing pod metadata",
+                    .{},
+                );
+                return models.ExecResult{
+                    .exit_code = 1,
+                    .stdout = try self.allocator.dupe(u8, ""),
+                    .stderr = stderr_msg,
+                    .duration_ms = std.time.milliTimestamp() - start_time,
+                };
+            };
+
+            const name = if (metadata.get("name")) |n|
+                if (n == .string) n.string else {
+                    const stderr_msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "Invalid pod name in metadata",
+                        .{},
+                    );
+                    return models.ExecResult{
+                        .exit_code = 1,
+                        .stdout = try self.allocator.dupe(u8, ""),
+                        .stderr = stderr_msg,
+                        .duration_ms = std.time.milliTimestamp() - start_time,
+                    };
+                }
+            else {
+                const stderr_msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Missing pod name in metadata",
+                    .{},
+                );
+                return models.ExecResult{
+                    .exit_code = 1,
+                    .stdout = try self.allocator.dupe(u8, ""),
+                    .stderr = stderr_msg,
+                    .duration_ms = std.time.milliTimestamp() - start_time,
+                };
+            };
+
+            // Duplicate pod name to keep it after arena deinit
+            break :blk try self.allocator.dupe(u8, name);
+        };
+        defer self.allocator.free(pod_name);
 
         // Step 2: Parse command into array
         var cmd_parts = std.ArrayList([]const u8).init(self.allocator);
@@ -747,11 +987,12 @@ pub const K7Core = struct {
         try cmd_parts.append(command);
 
         // Step 3: Execute command via Kubernetes exec API
-        // This requires WebSocket support which is complex
-        // For now, use the exec API endpoint
-        const pod_name = try std.fmt.allocPrint(self.allocator, "{s}-pod", .{sandbox_name});
-        defer self.allocator.free(pod_name);
-
+        // Note: Kubernetes exec API uses WebSocket protocol with SPDY or WebSocket streams
+        // The response format is binary with channel prefixes:
+        // - Channel 1: stdout
+        // - Channel 2: stderr
+        // - Channel 3: exit code (JSON: {"status":"Success","code":0} or {"status":"Failure","code":N})
+        // Full implementation requires WebSocket client with binary frame parsing
         const exec_response = self.kube_client.execInPod(
             namespace,
             pod_name,
@@ -773,15 +1014,33 @@ pub const K7Core = struct {
         };
         defer self.allocator.free(exec_response);
 
-        // TODO: Parse exec response to extract stdout, stderr, exit code
-        // WebSocket exec protocol returns binary stream with channel prefixes
-        // For now, return placeholder response
-
+        // Parse exec response
+        // The Kubernetes client's execInPod returns the raw response body
+        // For simplicity, treat the entire response as stdout for now
+        // A full implementation would:
+        // 1. Parse WebSocket frames with channel prefixes (1 byte: channel, rest: data)
+        // 2. Split stdout (channel 1) from stderr (channel 2)
+        // 3. Parse exit code from channel 3 JSON payload
+        // For now, basic string handling:
         const duration_ms = std.time.milliTimestamp() - start_time;
 
+        // Check if response indicates error
+        if (std.mem.indexOf(u8, exec_response, "error") != null or
+            std.mem.indexOf(u8, exec_response, "Error") != null or
+            std.mem.indexOf(u8, exec_response, "failed") != null)
+        {
+            return models.ExecResult{
+                .exit_code = 1,
+                .stdout = try self.allocator.dupe(u8, ""),
+                .stderr = try self.allocator.dupe(u8, exec_response),
+                .duration_ms = duration_ms,
+            };
+        }
+
+        // Assume success for now
         return models.ExecResult{
             .exit_code = 0,
-            .stdout = try self.allocator.dupe(u8, "Command executed successfully"),
+            .stdout = try self.allocator.dupe(u8, exec_response),
             .stderr = try self.allocator.dupe(u8, ""),
             .duration_ms = duration_ms,
         };

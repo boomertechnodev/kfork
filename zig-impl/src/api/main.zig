@@ -416,10 +416,57 @@ pub const ApiServer = struct {
     }
 
     fn handleGetSandbox(self: *ApiServer, response: *std.http.Server.Response, name: []const u8) !void {
-        _ = self;
-        _ = name;
-        // TODO: Implement get single sandbox
-        try self.sendJsonError(response, .not_implemented, "Get sandbox not yet implemented");
+        // Parse namespace from query params (default: "default")
+        const target = response.request.target;
+        const namespace_param = try parseQueryParam(self.allocator, target, "namespace");
+        defer if (namespace_param) |ns| self.allocator.free(ns);
+
+        const namespace = namespace_param orelse "default";
+
+        // Query for specific pod using label selector
+        const label_selector = try std.fmt.allocPrint(self.allocator, "app={s},runtime=kata,managed-by=k7", .{name});
+        defer self.allocator.free(label_selector);
+
+        const sandboxes = self.k7_core.listSandboxes(namespace) catch |err| {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Failed to get sandbox: {s}",
+                .{@errorName(err)},
+            );
+            defer self.allocator.free(err_msg);
+            try self.sendJsonError(response, .internal_server_error, err_msg);
+            return;
+        };
+        defer self.allocator.free(sandboxes);
+
+        // Find the sandbox with matching name
+        var found_sandbox: ?models.SandboxInfo = null;
+        for (sandboxes) |sandbox| {
+            if (std.mem.eql(u8, sandbox.name, name) and std.mem.eql(u8, sandbox.namespace, namespace)) {
+                found_sandbox = sandbox;
+                break;
+            }
+        }
+
+        if (found_sandbox) |sandbox| {
+            // Serialize to JSON
+            const json = try sandbox.toJson(self.allocator);
+            defer self.allocator.free(json);
+
+            try response.headers.append("content-type", "application/json");
+            response.status = .ok;
+            try response.do();
+            try response.writeAll(json);
+            try response.finish();
+        } else {
+            const err_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "Sandbox '{s}' not found in namespace '{s}'",
+                .{ name, namespace },
+            );
+            defer self.allocator.free(err_msg);
+            try self.sendJsonError(response, .not_found, err_msg);
+        }
     }
 
     fn handleDeleteSandbox(self: *ApiServer, response: *std.http.Server.Response, name: []const u8) !void {
